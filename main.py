@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.cors import CORSMiddleware
 from typing import Optional
 import httpx
+import time
 
 app = FastAPI(title="Binance Kline Proxy", version="0.1.0")
 
@@ -12,6 +13,55 @@ app.add_middleware(
 )
 
 BINANCE_KLINE_ENDPOINT = "https://api.binance.com/api/v3/klines"
+
+# --- Simple in-memory symbol cache {quoteAsset: (timestamp, [symbols])} ---
+_SYMBOL_CACHE: dict[str, tuple[float, list[str]]] = {}
+_SYMBOL_CACHE_TTL = 3600  # seconds
+
+
+@app.get("/symbols")
+async def symbols(
+    quote: str = Query("USDT", description="Quote asset filter, e.g. USDT")
+):
+    """Return tradable symbols from Binance filtered by quote asset.
+
+    Result is cached in memory for 1 hour to reduce upstream calls.
+    """
+
+    quote = quote.upper()
+    now = time.time()
+    if quote in _SYMBOL_CACHE:
+        ts, data = _SYMBOL_CACHE[quote]
+        if now - ts < _SYMBOL_CACHE_TTL:
+            return JSONResponse(
+                content=data, headers={"Cache-Control": "public, max-age=300"}
+            )
+
+    # Fetch fresh exchange info
+    url = "https://api.binance.com/api/v3/exchangeInfo"
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            resp = await client.get(url)
+            resp.raise_for_status()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503, detail=f"Failed to fetch exchange info: {exc}"
+            )
+
+    info = resp.json()
+    syms_raw = info.get("symbols", [])
+    symbols_list: list[str] = [
+        s["symbol"]
+        for s in syms_raw
+        if s.get("status") == "TRADING" and s.get("quoteAsset") == quote
+    ]
+    symbols_list.sort()
+
+    # cache
+    _SYMBOL_CACHE[quote] = (now, symbols_list)
+
+    headers = {"Cache-Control": "public, max-age=300"}
+    return JSONResponse(content=symbols_list, headers=headers)
 
 
 @app.get("/klines")
