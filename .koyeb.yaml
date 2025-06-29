@@ -1,0 +1,4 @@
+name: kline-proxy
+routes:
+  - path: /
+    port: 8080
